@@ -24,6 +24,12 @@
 # Go workspace file
 go.work
 
+# Compiled binary for this project
+/astrobin-csv
+
+# Default CSV output
+/acquisition.csv
+
 ### macOS ###
 # General
 .DS_Store

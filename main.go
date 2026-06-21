@@ -1,0 +1,173 @@
+// Command astrobin-csv scans a directory of LIGHT frames (FITS or XISF)
+// captured by N.I.N.A., groups them by filter, and writes a CSV in the format
+// AstroBin's "import acquisitions from CSV" dialogue expects:
+//
+//	https://welcome.astrobin.com/importing-acquisitions-from-csv
+//
+// One row is written per filter, aggregating every light frame found for that
+// filter across all nights/sessions under the given directory.
+//
+// Filter name -> AstroBin numeric filter ID mapping is read from a small YAML
+// config file (default: ~/.astrobin-csv.yaml).
+package main
+
+import (
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/alecthomas/kong"
+)
+
+// CSV column order, per the official AstroBin import spec. (The date column is
+// omitted deliberately -- we aggregate across all nights into one row per
+// filter, so a single date isn't meaningful.)
+var csvFields = []string{
+	"filter",
+	"number",
+	"duration",
+	"binning",
+	"gain",
+	"sensorCooling",
+	"darks",
+	"flats",
+	"flatDarks",
+	"bias",
+}
+
+var fitsExtensions = map[string]bool{".fits": true, ".fit": true, ".fts": true}
+var xisfExtensions = map[string]bool{".xisf": true}
+
+// CLI is the command-line interface, parsed by kong.
+var CLI struct {
+	Directory string `arg:"" name:"directory" type:"existingdir" help:"Directory containing light frames (searched recursively)."`
+	Output    string `name:"output" short:"o" type:"path" default:"acquisition.csv" help:"Output CSV path."`
+	Config    string `name:"config" short:"c" type:"path" default:"~/.astrobin-csv.yaml" help:"YAML filter-name -> AstroBin-filter-ID config."`
+}
+
+func main() {
+	kong.Parse(&CLI,
+		kong.Name("astrobin-csv"),
+		kong.Description("Generate an AstroBin acquisition CSV from NINA FITS/XISF light frames."),
+		kong.UsageOnError(),
+	)
+
+	filterMap, err := loadFilterMap(CLI.Config)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	accumulators, err := scanDirectory(CLI.Directory)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	if len(accumulators) == 0 {
+		fmt.Println("No light frames found. Nothing to write.")
+		os.Exit(1)
+	}
+
+	fmt.Println("\nSummary by filter:")
+	for _, name := range sortedKeys(accumulators) {
+		acc := accumulators[name]
+		dur, ok := mostCommon(acc.durations)
+		durStr := "?"
+		totalHours := 0.0
+		if ok {
+			durStr = fmt.Sprintf("%.0fs", dur)
+			totalHours = float64(acc.count) * dur / 3600
+		}
+		fmt.Printf("  %-10s %4d frames  x %6s  (~%.2fh)\n", name, acc.count, durStr, totalHours)
+	}
+
+	if err := writeCSV(accumulators, filterMap, CLI.Output); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+// sortedKeys returns the keys of a filter-accumulator map in sorted order.
+func sortedKeys(m map[string]*filterAccumulator) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// writeCSV writes the aggregated per-filter rows to outputPath.
+func writeCSV(accumulators map[string]*filterAccumulator, filterMap map[string]int, outputPath string) error {
+	lines := []string{strings.Join(csvFields, ",")}
+
+	var unmapped []string
+	rows := 0
+	for _, filterName := range sortedKeys(accumulators) {
+		acc := accumulators[filterName]
+
+		astrobinID, ok := filterMap[filterName]
+		if !ok {
+			unmapped = append(unmapped, filterName)
+			continue
+		}
+
+		row := map[string]string{
+			"filter":        fmt.Sprintf("%d", astrobinID),
+			"number":        fmt.Sprintf("%d", acc.count),
+			"duration":      "",
+			"binning":       "",
+			"gain":          "",
+			"sensorCooling": "",
+			"darks":         "",
+			"flats":         "",
+			"flatDarks":     "",
+			"bias":          "",
+		}
+		if duration, ok := mostCommon(acc.durations); ok {
+			row["duration"] = fmt.Sprintf("%.4f", duration)
+		}
+		if binning, ok := mostCommon(acc.binnings); ok {
+			row["binning"] = fmt.Sprintf("%d", binning)
+		}
+		if gain, ok := mostCommon(acc.gains); ok {
+			row["gain"] = fmt.Sprintf("%.2f", gain)
+		}
+		if temp, ok := mostCommon(acc.temps); ok {
+			row["sensorCooling"] = fmt.Sprintf("%d", roundToInt(temp))
+		}
+
+		cells := make([]string, len(csvFields))
+		for i, field := range csvFields {
+			cells[i] = row[field]
+		}
+		lines = append(lines, strings.Join(cells, ","))
+		rows++
+	}
+
+	content := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(outputPath, []byte(content), 0o644); err != nil {
+		return fmt.Errorf("writing %s: %w", outputPath, err)
+	}
+
+	fmt.Printf("\nWrote %s (%d filter rows)\n", outputPath, rows)
+
+	if len(unmapped) > 0 {
+		fmt.Println("\nWARNING: these filter names had no entry in the filter config and were skipped:")
+		for _, name := range unmapped {
+			fmt.Printf("  - %s\n", name)
+		}
+		fmt.Println("Add them to your filter config and re-run.")
+	}
+	return nil
+}
+
+// roundToInt rounds a float to the nearest integer (half away from zero).
+func roundToInt(f float64) int {
+	if f < 0 {
+		return int(f - 0.5)
+	}
+	return int(f + 0.5)
+}

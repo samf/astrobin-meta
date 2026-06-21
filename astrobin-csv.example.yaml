@@ -1,0 +1,12 @@
+# Copy this to ~/.astrobin-csv.yaml and edit to match your filters.
+#
+# Maps the FILTER keyword found in your FITS/XISF headers to the numeric
+# AstroBin filter ID. Find your filter IDs in the AstroBin equipment database.
+filters:
+  L: 33995
+  R: 32342
+  G: 32343
+  B: 32344
+  H: 43627
+  O: 43628
+  S: 43629
